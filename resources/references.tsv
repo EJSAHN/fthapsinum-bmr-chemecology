@@ -1,0 +1,8 @@
+label	species	role	accession	species_group	include_in_competitive	require_annotation	require_protein
+SB_BTx623	Sorghum bicolor BTx623	host reference	GCF_000003195.3	SB	1	1	1
+FTH_FL4	Fusarium thapsinum FL-4	target pathogen reference	GCA_046463835.1	FT	1	0	0
+FTH_NRRL22049	Fusarium thapsinum NRRL 22049	within-species comparison	GCA_013186935.1	FT_ALT	0	0	0
+MP_MS6	Macrophomina phaseolina MS6	secondary pathogen reference	GCA_000302655.1	MP	1	1	1
+FV_7600	Fusarium verticillioides 7600	gene-model source and decoy	GCF_000149555.1	FV	1	1	1
+FPRO_ET1	Fusarium proliferatum ET1	comparative reference and decoy	GCA_900067095.1	FPRO	1	1	1
+FFUJ_IMI58289	Fusarium fujikuroi IMI58289	comparative reference and decoy	GCA_900079805.1	FFUJ	1	1	1

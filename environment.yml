@@ -1,0 +1,36 @@
+name: fthapsinum-bmr-chemecology
+channels:
+  - conda-forge
+  - bioconda
+channel_priority: strict
+dependencies:
+  - python=3.11
+  - snakemake-minimal>=8
+  - pandas>=2.1
+  - numpy
+  - scipy
+  - statsmodels
+  - pyyaml
+  - biopython
+  - pysam
+  - requests
+  - pytest
+  - fastp
+  - hisat2>=2.2
+  - samtools>=1.18
+  - subread>=2.0
+  - bedtools
+  - gffread
+  - mosdepth
+  - seqkit>=2.6
+  - ncbi-datasets-cli
+  - miniprot
+  - diamond
+  - hmmer
+  - pigz
+  - curl
+  - r-base>=4.3
+  - bioconductor-edger
+  - bioconductor-limma
+  - r-jsonlite
+  - r-statmod

@@ -1,0 +1,50 @@
+samples: resources/samples.tsv
+analysis_sets: resources/analysis_sets.tsv
+references: resources/references.tsv
+functional_terms: resources/functional_terms.yaml
+
+host_eigengene_url: https://static-content.springer.com/esm/art%3A10.1186%2Fs12870-021-03149-5/MediaObjects/12870_2021_3149_MOESM5_ESM.csv
+
+reference_labels:
+  host: SB_BTx623
+  target: FTH_FL4
+  target_alternative: FTH_NRRL22049
+  source_annotation: FV_7600
+  comparisons:
+    - FTH_NRRL22049
+    - FV_7600
+    - FPRO_ET1
+    - FFUJ_IMI58289
+  macrophomina: MP_MS6
+
+analysis:
+  minimum_mapping_quality: 20
+  gene_extension_bp: 1000
+  minimum_gene_count: 5
+  minimum_gene_samples: 3
+  context_minimum_assigned_reads: 5000
+  context_minimum_detected_genes: 300
+  context_minimum_target_reads: 5000
+  context_minimum_target_specificity: 0.85
+  false_discovery_rate: 0.05
+  minimum_absolute_log2_fold_change: 1.0
+  promoter_length_bp: 1000
+  matched_set_iterations: 10000
+  regulatory_matched_set_iterations: 20000
+  regulator_permutations: 50000
+  host_module_permutations: 50000
+  motif_conservation_iterations: 20000
+  random_seed: 20260716
+
+threads:
+  download: 2
+  align: 4
+  reference_index: 12
+  feature_counts: 12
+  annotation: 12
+
+outputs:
+  root: results
+  work: work
+  raw: data/raw
+  references: data/references
