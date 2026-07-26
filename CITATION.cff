@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "Please cite the accompanying manuscript and this software repository."
+title: "fthapsinum-bmr-chemecology"
+type: software
+authors:
+  - family-names: "Baek"
+    given-names: "Insuck"
+  - family-names: "Prom"
+    given-names: "Louis K."
+  - family-names: "Kim"
+    given-names: "Moon S."
+  - family-names: "Meinhardt"
+    given-names: "Lyndel W."
+  - family-names: "Fall"
+    given-names: "Coumba"
+  - family-names: "Magill"
+    given-names: "Clint"
+  - family-names: "Ahn"
+    given-names: "Ezekiel"
+repository-code: "https://github.com/EJSAHN/fthapsinum-bmr-chemecology"
+url: "https://github.com/EJSAHN/fthapsinum-bmr-chemecology"
+license: MIT
+keywords:
+  - Fusarium thapsinum
+  - sorghum
+  - pathogen transcriptomics
+  - brown midrib
+  - promoter motif
