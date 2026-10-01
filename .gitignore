@@ -1,0 +1,29 @@
+# Workflow outputs
+/data/
+/work/
+/results/
+/logs/
+
+# Snakemake
+/.snakemake/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.part
+*.tmp
+*.bak

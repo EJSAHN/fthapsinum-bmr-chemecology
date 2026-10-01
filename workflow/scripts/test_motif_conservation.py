@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from scipy.stats import fisher_exact
+from motif_inference import choose_follow_up
 
 
 def revcomp(seq: str) -> str:
@@ -196,7 +197,8 @@ def scan_motif(sequence: str, motif: str) -> dict:
     motif = motif.upper()
     rc = revcomp(motif)
     hits: List[Tuple[int, str]] = []
-    for pattern, orientation in ((motif, "+"), (rc, "-")):
+    patterns = [(motif, "+")] if motif == rc else [(motif, "+"), (rc, "-")]
+    for pattern, orientation in patterns:
         for match in re.finditer(f"(?={re.escape(pattern)})", sequence):
             hits.append((match.start(), orientation))
     hits.sort(key=lambda x: (x[0], x[1]))
@@ -294,200 +296,432 @@ def empirical_species_p(
 
 
 
+def parse_label_paths(values: Sequence[str]) -> dict[str, Path]:
+    paths = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(f"Expected LABEL=PATH, received {value}")
+        label, text = value.split("=", 1)
+        if not label or label in paths:
+            raise ValueError(f"Empty or duplicate reference label: {label}")
+        paths[label] = require(Path(text))
+    return paths
+
+
+def write_no_selection(tables: Path, decision: dict) -> None:
+    # Empty tables replace stale canonical summaries, including in reused output folders.
+    schemas = {
+        "ortholog_promoter_motif_calls.tsv": ["species", "gene_id", "is_focus", "analysis_valid", "motif_present"],
+        "ortholog_mapping_summary.tsv": ["species", "gene_id", "target_contig"],
+        "species_motif_enrichment.tsv": ["species", "focus_motif_positive", "focus_promoters_valid", "matched_empirical_p"],
+        "focus_gene_motif_conservation.tsv": ["gene_id", "fl4_motif_present"],
+        "focus_motif_conservation.tsv": ["gene_id", "fl4_motif_present"],
+        "focus_motif_position_conservation.tsv": ["gene_id", "species", "valid", "motif_present"],
+        "pooled_cross_species_motif_tests.tsv": ["test", "species", "matched_empirical_p"],
+        "sequence_record_layout.tsv": ["species", "projected_genes", "unique_sequence_records"],
+        "fixed_motif_definition.tsv": ["motif", "selection_mode", "full_family_q"],
+    }
+    for name, columns in schemas.items():
+        pd.DataFrame(columns=columns).to_csv(tables / name, sep="\t", index=False)
+    (tables / "motif_conservation.json").write_text(json.dumps(decision, indent=2) + "\n", encoding="utf-8")
+
+
+def sequence_record_layout(calls: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for species, sub in calls[calls["is_focus"] & calls["analysis_valid"]].groupby("species", sort=True):
+        sub = sub.drop_duplicates("gene_id")
+        gaps = []
+        records = sub.to_dict("records")
+        for i, left in enumerate(records):
+            for right in records[i + 1:]:
+                if left["target_contig"] != right["target_contig"]:
+                    continue
+                a, b = sorted((left, right), key=lambda r: int(r["target_start_0based"]))
+                gaps.append(max(0, int(b["target_start_0based"]) - int(a["target_end_0based_exclusive"])))
+        rows.append({
+            "species": species, "projected_genes": len(sub),
+            "unique_sequence_records": sub["target_contig"].nunique(),
+            "same_sequence_pairs": len(gaps),
+            "minimum_within_sequence_intergenic_gap_bp": min(gaps) if gaps else np.nan,
+            "pairs_gap_le_20kb": sum(g <= 20000 for g in gaps),
+            "pairs_gap_le_50kb": sum(g <= 50000 for g in gaps),
+            "pairs_gap_le_100kb": sum(g <= 100000 for g in gaps),
+            "between_record_distances": "unknown",
+        })
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Test a fixed promoter motif in ortholog promoters.")
-    parser.add_argument("--motif-table", type=Path, required=True)
-    parser.add_argument("--focus-promoters", type=Path, required=True)
-    parser.add_argument("--matched-pools", type=Path, required=True)
-    parser.add_argument("--focus-promoter-fasta", type=Path, required=True)
-    parser.add_argument("--background-promoter-fasta", type=Path, required=True)
-    parser.add_argument("--source-proteins", type=Path, required=True)
-    parser.add_argument("--gene-annotation", type=Path, required=True)
-    parser.add_argument("--genome", action="append", default=[], help="LABEL=GENOME_FASTA")
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--work-dir", type=Path, required=True)
-    parser.add_argument("--threads", type=int, default=12)
-    parser.add_argument("--promoter-bp", type=int, default=1000)
-    parser.add_argument("--matched-iterations", type=int, default=20000)
-    parser.add_argument("--seed", type=int, default=20260716)
-    parser.add_argument("--motif", default="AUTO")
-    parser.add_argument("--miniprot", default="miniprot")
-    args = parser.parse_args()
-
-    out = args.output_dir
-    tables = out / "tables"
-    sequences = out / "sequences"
-    mappings = out / "mappings"
-    for directory in (out, args.work_dir, tables, sequences, mappings):
+    ap = argparse.ArgumentParser(description="Compare an explicitly selected promoter sequence across projected loci.")
+    ap.add_argument("--motif-table", type=Path, required=True)
+    ap.add_argument("--focus-promoters", type=Path, required=True)
+    ap.add_argument("--matched-pools", type=Path, required=True)
+    ap.add_argument("--focus-promoter-fasta", type=Path, required=True)
+    ap.add_argument("--background-promoter-fasta", type=Path, required=True)
+    ap.add_argument("--source-proteins", type=Path, required=True)
+    ap.add_argument("--gene-annotation", type=Path, required=True)
+    ap.add_argument("--genome", action="append", default=[], help="LABEL=GENOME_FASTA")
+    ap.add_argument("--mapping", action="append", default=[], help="LABEL=EXISTING_MINIPROT_GFF; optional upstream projection input")
+    ap.add_argument("--reference-label", default="FTH_FL4")
+    ap.add_argument("--within-species-label", default="FTH_NRRL22049")
+    ap.add_argument("--output-dir", type=Path, required=True)
+    ap.add_argument("--work-dir", type=Path, required=True)
+    ap.add_argument("--threads", type=int, default=12)
+    ap.add_argument("--promoter-bp", type=int, default=1000)
+    ap.add_argument("--matched-iterations", type=int, default=20000)
+    ap.add_argument("--position-tolerance-bp", type=int, default=150)
+    ap.add_argument("--seed", type=int, default=20260716)
+    ap.add_argument("--selection-mode", choices=["auto", "exploratory"], default="auto")
+    ap.add_argument("--selection-fdr", type=float, default=0.10)
+    ap.add_argument("--motif", default="AUTO")
+    ap.add_argument("--miniprot", default="miniprot")
+    args = ap.parse_args()
+    if args.matched_iterations < 1 or args.promoter_bp < 1:
+        raise ValueError("Iteration count and promoter window must be positive")
+    out, work = args.output_dir, args.work_dir
+    tables, sequences, mappings = out / "tables", out / "sequences", out / "mappings"
+    for directory in (out, work, tables, sequences, mappings):
         directory.mkdir(parents=True, exist_ok=True)
-
     motif_table = pd.read_csv(require(args.motif_table), sep="\t")
-    if args.motif.upper() == "AUTO":
-        robust = motif_table[motif_table["robust"].astype(str).str.lower().isin({"true", "1", "yes"})]
-        if len(robust) != 1:
-            raise RuntimeError(f"Expected one robust motif, found {len(robust)}")
-        motif = canonical_kmer(str(robust.iloc[0]["motif"]))
-    else:
-        motif = canonical_kmer(args.motif)
-
-    focus_info = pd.read_csv(require(args.focus_promoters), sep="\t", dtype=str).fillna("")
-    pools_table = pd.read_csv(require(args.matched_pools), sep="\t", dtype=str).fillna("")
+    selection = choose_follow_up(motif_table, args.selection_mode, args.motif, args.selection_fdr)
+    (tables / "candidate_selection.json").write_text(json.dumps(selection, indent=2) + "\n", encoding="utf-8")
+    if selection["motif"] is None:
+        write_no_selection(tables, selection)
+        print("MOTIF_FOLLOW_UP=" + selection["status"], flush=True)
+        return
+    motif, motif_rc = selection["motif"], selection["reverse_complement"]
+    focus_promoters = pd.read_csv(require(args.focus_promoters), sep="\t")
+    matched_pools_df = pd.read_csv(require(args.matched_pools), sep="\t")
     focus_fasta = read_fasta(require(args.focus_promoter_fasta))
     background_fasta = read_fasta(require(args.background_promoter_fasta))
-    proteins = read_fasta(require(args.source_proteins))
-    annotation = pd.read_csv(require(args.gene_annotation), sep="\t", dtype=str).fillna("")
-
-    focus_genes = focus_info["gene_id"].astype(str).tolist()
-    pools = {
-        str(gene): subset.sort_values("rank")["matched_gene"].astype(str).tolist()
-        for gene, subset in pools_table.groupby("focus_gene")
+    source_proteins = read_fasta(require(args.source_proteins))
+    gene_annotation = pd.read_csv(require(args.gene_annotation), sep="\t")
+    projection_inputs = parse_label_paths(args.mapping)
+    species_genomes = {args.reference_label: None, **parse_label_paths(args.genome)}
+    if args.reference_label in parse_label_paths(args.genome):
+        raise ValueError("The focal reference uses the supplied promoters; do not repeat it in --genome")
+    if set(projection_inputs) - set(species_genomes):
+        raise ValueError("Every supplied mapping must have a matching --genome")
+    matched_pools_df["rank"] = pd.to_numeric(matched_pools_df["rank"], errors="raise")
+    focus_genes = focus_promoters["gene_id"].astype(str).tolist()
+    if len(set(focus_genes)) != len(focus_genes) or not focus_genes:
+        raise ValueError("Focus identifiers must be nonempty and unique")
+    pools: Dict[str, List[str]] = {
+        str(g): sub.sort_values("rank")["matched_gene"].astype(str).tolist()
+        for g, sub in matched_pools_df.groupby("focus_gene")
     }
-    background_genes = sorted(set(pools_table["matched_gene"].astype(str)))
-    query_genes = focus_genes + [gene for gene in background_genes if gene not in focus_genes]
-    missing = [gene for gene in query_genes if gene not in proteins]
-    if missing:
-        raise RuntimeError(f"Missing source proteins: {missing[:5]}")
-    query_faa = sequences / "query_proteins.faa"
-    write_fasta(((gene, proteins[gene]) for gene in query_genes), query_faa)
+    background_genes = sorted(set(matched_pools_df["matched_gene"].astype(str)))
+    query_genes = focus_genes + [g for g in background_genes if g not in focus_genes]
+    missing_proteins = [g for g in query_genes if g not in source_proteins]
+    if missing_proteins:
+        raise RuntimeError(f"Source proteins missing for {len(missing_proteins)} queried genes; first={missing_proteins[:5]}")
 
-    genomes = {"FTH_FL4": None}
-    for item in args.genome:
-        if "=" not in item:
-            raise RuntimeError(f"Invalid --genome value: {item}")
-        label, path = item.split("=", 1)
-        genomes[label] = require(Path(path))
+    query_faa = sequences / "focus_and_matched_source_proteins.faa"
+    write_fasta(((g, source_proteins[g]) for g in query_genes), query_faa)
 
-    promoter_rows = []
+    promoter_rows: List[dict] = []
+    mapping_rows: List[pd.DataFrame] = []
     promoter_sequences: Dict[Tuple[str, str], str] = {}
-    focus_map = focus_info.set_index("gene_id").to_dict("index")
-    background_info_path = args.background_promoter_fasta.parent.parent / "tables" / "matched_background_promoters.tsv"
-    background_map = pd.read_csv(background_info_path, sep="\t", dtype=str).fillna("").set_index("gene_id").to_dict("index") if background_info_path.exists() else {}
-    for gene in query_genes:
-        sequence = focus_fasta.get(gene, background_fasta.get(gene, ""))
-        if not sequence:
+
+    if set(focus_genes) != set(focus_fasta) or set(background_genes) != set(background_fasta):
+        raise ValueError("FASTA records do not match focus and matched-background tables")
+    if set(focus_genes) & set(background_genes):
+        raise ValueError("Foreground and background overlap")
+    # Use the focal-reference promoter sequences from the upstream analysis.
+    fl4_info = focus_promoters.set_index("gene_id").to_dict("index")
+    background_info = pd.read_csv(require(args.background_promoter_fasta.parent.parent / "tables" / "matched_background_promoters.tsv"), sep="\t").set_index("gene_id").to_dict("index")
+    for gene_id in query_genes:
+        seq = focus_fasta.get(gene_id, background_fasta.get(gene_id, ""))
+        info = fl4_info.get(gene_id, background_info.get(gene_id, {}))
+        if not seq:
             continue
-        info = focus_map.get(gene, background_map.get(gene, {}))
-        call = scan_motif(sequence, motif)
-        promoter_sequences[("FTH_FL4", gene)] = sequence
+        scan = scan_motif(seq, motif)
+        promoter_sequences[(args.reference_label, gene_id)] = seq
         promoter_rows.append({
-            "species": "FTH_FL4", "gene_id": gene, "is_focus": gene in focus_genes,
-            "mapping_confidence": "reference", "query_coverage_pct": 100.0,
-            "alignment_identity_pct": 100.0, "target_contig": info.get("fasta_contig", info.get("contig", "")),
-            "strand": info.get("strand", ""), "promoter_length": len(sequence),
-            "promoter_status": "ok", **call,
+            "species": args.reference_label,
+            "gene_id": gene_id,
+            "is_focus": gene_id in focus_genes,
+            "mapping_confidence": "reference",
+            "query_coverage_pct": 100.0,
+            "alignment_identity_pct": 100.0,
+            "alignment_count": 1,
+            "top_second_score_ratio": np.inf,
+            "target_contig": info.get("fasta_contig", info.get("contig", "")),
+            "target_start_0based": int(info.get("gene_start", 1)) - 1 if info else np.nan,
+            "target_end_0based_exclusive": int(info.get("gene_end", 0)) if info else np.nan,
+            "strand": info.get("strand", ""),
+            "promoter_length": len(seq),
+            "promoter_gc": (seq.count("G") + seq.count("C")) / max(1, len(seq)),
+            "promoter_n_fraction": seq.count("N") / max(1, len(seq)),
+            "promoter_status": "ok",
+            **scan,
         })
 
-    mapping_tables = []
-    for species, genome_path in genomes.items():
-        if species == "FTH_FL4":
+    for species, genome_path in species_genomes.items():
+        if species == args.reference_label:
             continue
-        mapping_file = mappings / f"{species}.miniprot.gff3"
-        run_command([args.miniprot, "-t", str(args.threads), "-I", "--gff", "--aln", str(genome_path), str(query_faa)], mapping_file)
-        mapping = parse_miniprot_paf(mapping_file, species)
+        map_path = mappings / f"{species}.miniprot.gff3"
+        if species in projection_inputs:
+            # Explicit supplied upstream alignment; never download or overwrite it.
+            map_path = projection_inputs[species]
+        else:
+            run_command([args.miniprot, "-t", str(args.threads), "-I", "--gff", "--aln",
+                         str(genome_path), str(query_faa)], map_path)
+        mapping = parse_miniprot_paf(map_path, species)
         if mapping.empty:
-            raise RuntimeError(f"No mappings for {species}")
-        mapping_tables.append(mapping)
+            raise RuntimeError(f"No miniprot mappings parsed for {species}")
+        mapping_rows.append(mapping)
         genome = read_fasta(genome_path)
         for _, row in mapping.iterrows():
-            gene = str(row["gene_id"])
-            if gene not in query_genes:
+            gene_id = str(row["gene_id"])
+            if gene_id not in query_genes:
                 continue
+            if int(row["query_length_aa"]) != len(source_proteins[gene_id]):
+                raise ValueError(f"Projection query length mismatch: {species} {gene_id}")
+            contig = str(row["target_contig"])
+            if contig not in genome or int(row["target_length"]) != len(genome[contig]):
+                raise ValueError(f"Projection reference length mismatch: {species} {contig}")
             promoter, left, right, status = extract_oriented_promoter(row, genome, args.promoter_bp)
-            call = scan_motif(promoter, motif) if promoter else {
+            scan = scan_motif(promoter, motif) if promoter else {
                 "motif_present": False, "motif_count": 0, "motif_positions_1based": "",
                 "motif_orientations": "", "motif_distances_to_gene_bp": "",
                 "nearest_gene_distance_bp": np.nan, "nearest_hit_start_0based": np.nan,
                 "nearest_hit_orientation": "",
             }
             if promoter:
-                promoter_sequences[(species, gene)] = promoter
+                promoter_sequences[(species, gene_id)] = promoter
             promoter_rows.append({
-                "species": species, "gene_id": gene, "is_focus": gene in focus_genes,
+                "species": species,
+                "gene_id": gene_id,
+                "is_focus": gene_id in focus_genes,
                 "mapping_confidence": row["mapping_confidence"],
                 "query_coverage_pct": row["query_coverage_pct"],
                 "alignment_identity_pct": row["alignment_identity_pct"],
-                "target_contig": row["target_contig"], "strand": row["strand"],
-                "promoter_start": left, "promoter_end": right, "promoter_length": len(promoter),
-                "promoter_status": status, **call,
+                "alignment_count": row["alignment_count"],
+                "top_second_score_ratio": row["top_second_score_ratio"],
+                "target_contig": row["target_contig"],
+                "target_start_0based": row["target_start_0based"],
+                "target_end_0based_exclusive": row["target_end_0based_exclusive"],
+                "strand": row["strand"],
+                "promoter_genomic_left_0based": left,
+                "promoter_genomic_right_0based_exclusive": right,
+                "promoter_length": len(promoter),
+                "promoter_gc": (promoter.count("G") + promoter.count("C")) / max(1, len(promoter)) if promoter else np.nan,
+                "promoter_n_fraction": promoter.count("N") / max(1, len(promoter)) if promoter else np.nan,
+                "promoter_status": status,
+                **scan,
             })
-    calls = pd.DataFrame(promoter_rows)
-    valid_confidence = {"reference", "HIGH", "MODERATE", "MODERATE_PARALOG_AMBIGUITY"}
-    calls["analysis_valid"] = calls["promoter_status"].eq("ok") & calls["mapping_confidence"].isin(valid_confidence)
-    calls.to_csv(tables / "ortholog_promoter_motif_calls.tsv", sep="\t", index=False, lineterminator="\n", na_rep="NA")
-    if mapping_tables:
-        pd.concat(mapping_tables, ignore_index=True).to_csv(tables / "ortholog_mapping.tsv", sep="\t", index=False, lineterminator="\n")
-    write_fasta(
-        ((f"{species}|{gene}", sequence) for (species, gene), sequence in promoter_sequences.items() if gene in focus_genes),
-        sequences / "focus_ortholog_promoters.fasta",
-    )
+
+    promoter_df = pd.DataFrame(promoter_rows)
+    valid_conf = {"reference", "HIGH", "MODERATE_PARALOG_AMBIGUITY", "MODERATE"}
+    promoter_df["analysis_valid"] = promoter_df["promoter_status"].eq("ok") & promoter_df["mapping_confidence"].isin(valid_conf)
+    promoter_df.to_csv(tables / "ortholog_promoter_motif_calls.tsv", sep="\t", index=False)
+    if mapping_rows:
+        pd.concat(mapping_rows, ignore_index=True).to_csv(tables / "ortholog_mapping_summary.tsv", sep="\t", index=False)
+
+    # Write focus ortholog promoter FASTA.
+    focus_records = []
+    for (species, gene_id), seq in promoter_sequences.items():
+        if gene_id in focus_genes:
+            focus_records.append((f"{species}|{gene_id}", seq))
+    write_fasta(focus_records, sequences / "focus_ortholog_promoters.fasta")
+
+    fl4_focus = promoter_df[(promoter_df["species"] == args.reference_label) & promoter_df["is_focus"]]
+    observed_focus = int(fl4_focus["motif_present"].sum())
+    if observed_focus != selection["foreground_present"] or len(fl4_focus) != selection["foreground_total"]:
+        raise ValueError("Follow-up focal counts disagree with the full-family discovery table")
 
     rng = np.random.default_rng(args.seed)
-    species_rows = []
-    motif_maps: Dict[str, Dict[str, bool]] = {}
-    for species in genomes:
-        subset = calls[(calls["species"].eq(species)) & calls["analysis_valid"]].copy()
-        motif_map = dict(zip(subset["gene_id"].astype(str), subset["motif_present"].astype(bool)))
-        motif_maps[species] = motif_map
-        focus_valid = [gene for gene in focus_genes if gene in motif_map]
-        background_valid = set(gene for gene in background_genes if gene in motif_map)
-        observed = sum(motif_map[gene] for gene in focus_valid)
-        p, successful = empirical_species_p(
-            motif_map, focus_valid, pools, background_valid, args.matched_iterations, rng
-        )
+    species_rows: List[dict] = []
+    motif_maps_by_species: Dict[str, Dict[str, bool]] = {}
+    for species in species_genomes:
+        sub = promoter_df[(promoter_df["species"] == species) & promoter_df["analysis_valid"]].copy()
+        motif_map = dict(zip(sub["gene_id"].astype(str), sub["motif_present"].astype(bool)))
+        motif_maps_by_species[species] = motif_map
+        focus_sub = sub[sub["gene_id"].isin(focus_genes)]
+        bg_sub = sub[sub["gene_id"].isin(background_genes)]
+        focus_pos = int(focus_sub["motif_present"].sum())
+        focus_total = int(len(focus_sub))
+        bg_pos = int(bg_sub["motif_present"].sum())
+        bg_total = int(len(bg_sub))
+        if focus_total > 0 and bg_total > 0:
+            odds, fisher_p = fisher_exact([[focus_pos, focus_total - focus_pos], [bg_pos, bg_total - bg_pos]], alternative="greater")
+        else:
+            odds, fisher_p = np.nan, np.nan
+        empirical_p, observed, empirical_n = empirical_species_p(focus_genes, motif_map, pools, args.matched_iterations, rng)
         species_rows.append({
             "species": species,
-            "focus_promoters_valid": len(focus_valid),
-            "focus_motif_positive": observed,
-            "focus_fraction": observed / len(focus_valid) if focus_valid else np.nan,
-            "matched_empirical_p": p,
-            "successful_iterations": successful,
+            "focus_motif_positive": focus_pos,
+            "focus_promoters_valid": focus_total,
+            "background_motif_positive": bg_pos,
+            "background_promoters_valid": bg_total,
+            "focus_fraction": focus_pos / focus_total if focus_total else np.nan,
+            "background_fraction": bg_pos / bg_total if bg_total else np.nan,
+            "odds_ratio": odds,
+            "fisher_p": fisher_p,
+            "matched_empirical_p": empirical_p,
+            "empirical_focus_positive": observed,
+            "empirical_focus_n": empirical_n,
         })
-    species_table = pd.DataFrame(species_rows)
+    species_df = pd.DataFrame(species_rows)
+    species_df["fisher_fdr"] = bh_adjust(species_df["fisher_p"])
+    species_df["matched_empirical_fdr"] = bh_adjust(species_df["matched_empirical_p"])
 
-    fl4 = calls[(calls["species"].eq("FTH_FL4")) & calls["is_focus"]].set_index("gene_id")
-    conservation_rows = []
-    for gene in focus_genes:
-        row = {"gene_id": gene, "fl4_motif_present": bool(fl4.loc[gene, "motif_present"])}
-        fl4_distance = float(fl4.loc[gene, "nearest_gene_distance_bp"]) if pd.notna(fl4.loc[gene, "nearest_gene_distance_bp"]) else np.nan
-        row["fl4_distance_bp"] = fl4_distance
-        for species in genomes:
-            subset = calls[(calls["species"].eq(species)) & calls["gene_id"].eq(gene)]
-            valid = bool(len(subset) and subset.iloc[0]["analysis_valid"])
-            present = bool(valid and subset.iloc[0]["motif_present"])
-            distance = float(subset.iloc[0]["nearest_gene_distance_bp"]) if valid and pd.notna(subset.iloc[0]["nearest_gene_distance_bp"]) else np.nan
-            row[f"{species}_valid"] = valid
-            row[f"{species}_motif_present"] = present
-            row[f"{species}_distance_bp"] = distance
-            row[f"{species}_position_delta_bp"] = abs(distance - fl4_distance) if present and np.isfinite(fl4_distance) and np.isfinite(distance) else np.nan
-        conservation_rows.append(row)
-    conservation = pd.DataFrame(conservation_rows).merge(
-        annotation[[column for column in ("gene_id", "product", "description_text") if column in annotation]],
+    # Gene-wise conservation relative to the fixed FL-4 motif call.
+    fl4_lookup = fl4_focus.set_index("gene_id")
+    conservation_rows: List[dict] = []
+    position_rows: List[dict] = []
+    for gene_id in focus_genes:
+        fl4_row = fl4_lookup.loc[gene_id]
+        fl4_present = bool(fl4_row["motif_present"])
+        fl4_distance = float(fl4_row["nearest_gene_distance_bp"]) if pd.notna(fl4_row["nearest_gene_distance_bp"]) else np.nan
+        fl4_seq = promoter_sequences.get((args.reference_label, gene_id), "")
+        ref_fragment = ""
+        if fl4_present and pd.notna(fl4_row["nearest_hit_start_0based"]):
+            ref_fragment = flanking_window(fl4_seq, int(fl4_row["nearest_hit_start_0based"]), len(motif), 12)
+        row_out = {"gene_id": gene_id, "fl4_motif_present": fl4_present, "fl4_nearest_gene_distance_bp": fl4_distance}
+        valid_species = 0
+        positive_species = 0
+        external_positive = 0
+        external_valid = 0
+        for species in species_genomes:
+            sub = promoter_df[(promoter_df["species"] == species) & (promoter_df["gene_id"] == gene_id)]
+            if sub.empty:
+                valid = False
+                present = False
+                distance = np.nan
+                confidence = "MISSING"
+                fragment_identity = np.nan
+            else:
+                r = sub.iloc[0]
+                valid = bool(r["analysis_valid"])
+                present = bool(r["motif_present"]) if valid else False
+                distance = float(r["nearest_gene_distance_bp"]) if valid and pd.notna(r["nearest_gene_distance_bp"]) else np.nan
+                confidence = str(r["mapping_confidence"])
+                target_seq = promoter_sequences.get((species, gene_id), "")
+                fragment_identity = best_window_identity(ref_fragment, target_seq) if ref_fragment and target_seq else np.nan
+            if valid:
+                valid_species += 1
+                positive_species += int(present)
+                if species not in {args.reference_label, args.within_species_label}:
+                    external_valid += 1
+                    external_positive += int(present)
+            pos_delta = abs(distance - fl4_distance) if fl4_present and present and np.isfinite(distance) and np.isfinite(fl4_distance) else np.nan
+            position_conserved = bool(np.isfinite(pos_delta) and pos_delta <= args.position_tolerance_bp)
+            row_out[f"{species}_valid"] = valid
+            row_out[f"{species}_motif_present"] = present
+            row_out[f"{species}_nearest_gene_distance_bp"] = distance
+            row_out[f"{species}_mapping_confidence"] = confidence
+            row_out[f"{species}_flank31_best_identity"] = fragment_identity
+            position_rows.append({
+                "gene_id": gene_id,
+                "species": species,
+                "valid": valid,
+                "motif_present": present,
+                "nearest_gene_distance_bp": distance,
+                "fl4_distance_bp": fl4_distance,
+                "position_delta_bp": pos_delta,
+                "position_conserved_within_tolerance": position_conserved,
+                "flank31_best_identity": fragment_identity,
+            })
+        row_out["valid_species_count"] = valid_species
+        row_out["motif_positive_species_count"] = positive_species
+        row_out["external_valid_species_count"] = external_valid
+        row_out["external_motif_positive_species_count"] = external_positive
+        conservation_rows.append(row_out)
+    conservation_df = pd.DataFrame(conservation_rows)
+    conservation_df = conservation_df.merge(
+        gene_annotation[[c for c in ["gene_id", "source_accession", "source_product", "annotation_text"] if c in gene_annotation.columns]],
         on="gene_id", how="left",
     )
-    conservation.to_csv(tables / "focus_motif_conservation.tsv", sep="\t", index=False, lineterminator="\n", na_rep="NA")
+    conservation_df.to_csv(tables / "focus_gene_motif_conservation.tsv", sep="\t", index=False)
+    pd.DataFrame(position_rows).to_csv(tables / "focus_motif_position_conservation.tsv", sep="\t", index=False)
 
-    fl4_positive = set(conservation.loc[conservation["fl4_motif_present"], "gene_id"])
+    fl4_positive_genes = set(conservation_df.loc[conservation_df["fl4_motif_present"], "gene_id"])
     retention_rows = []
-    for species in genomes:
-        if species == "FTH_FL4":
+    for species in species_genomes:
+        if species == args.reference_label:
             continue
-        valid = conservation[conservation["gene_id"].isin(fl4_positive) & conservation[f"{species}_valid"]]
+        valid_col = f"{species}_valid"
+        motif_col = f"{species}_motif_present"
+        sub = conservation_df[conservation_df["gene_id"].isin(fl4_positive_genes) & conservation_df[valid_col].astype(bool)]
         retention_rows.append({
             "species": species,
-            "fl4_positive_orthologs_valid": len(valid),
-            "motif_retained": int(valid[f"{species}_motif_present"].sum()),
-            "retention_fraction": float(valid[f"{species}_motif_present"].mean()) if len(valid) else np.nan,
+            "fl4_positive_orthologs_valid": int(len(sub)),
+            "motif_retained": int(sub[motif_col].astype(bool).sum()),
+            "retention_fraction": float(sub[motif_col].astype(bool).mean()) if len(sub) else np.nan,
         })
-    retention = pd.DataFrame(retention_rows)
-    species_table = species_table.merge(retention, on="species", how="left")
-    species_table.to_csv(tables / "species_motif_enrichment.tsv", sep="\t", index=False, lineterminator="\n", na_rep="NA")
+    retention_df = pd.DataFrame(retention_rows)
+    species_df = species_df.merge(retention_df, on="species", how="left")
 
+    # Fixed-candidate pooled summaries preserve reference correspondence, not independent species replication.
+    def pooled_empirical(species_list: List[str]) -> Tuple[float, float, int, int]:
+        focus_valid_pairs = []
+        for g in focus_genes:
+            for s in species_list:
+                if g in motif_maps_by_species.get(s, {}):
+                    focus_valid_pairs.append((g, s))
+        if len(focus_valid_pairs) < 15:
+            return np.nan, np.nan, 0, len(focus_valid_pairs)
+        observed = sum(int(motif_maps_by_species[s][g]) for g, s in focus_valid_pairs) / len(focus_valid_pairs)
+        extreme = 0
+        successful = 0
+        for _ in range(args.matched_iterations):
+            chosen_by_focus: Dict[str, str] = {}
+            used: set[str] = set()
+            ok = True
+            for g in focus_genes:
+                candidates = [x for x in pools[g] if x not in used and any(x in motif_maps_by_species.get(s, {}) for s in species_list)]
+                if not candidates:
+                    ok = False
+                    break
+                pick = str(rng.choice(candidates))
+                chosen_by_focus[g] = pick
+                used.add(pick)
+            if not ok:
+                continue
+            vals = []
+            for g, s in focus_valid_pairs:
+                bg = chosen_by_focus[g]
+                if bg in motif_maps_by_species.get(s, {}):
+                    vals.append(int(motif_maps_by_species[s][bg]))
+            if not vals:
+                continue
+            successful += 1
+            random_fraction = sum(vals) / len(vals)
+            extreme += int(random_fraction >= observed - 1e-12)
+        p = (extreme + 1) / (successful + 1) if successful else np.nan
+        return observed, p, successful, len(focus_valid_pairs)
+
+    ext_species = [label for label in species_genomes if label not in {args.reference_label, args.within_species_label}]
+    external_fraction, external_p, external_successful, external_pairs = pooled_empirical(ext_species)
+    nonfl4_fraction, nonfl4_p, nonfl4_successful, nonfl4_pairs = pooled_empirical(([args.within_species_label] if args.within_species_label in species_genomes else []) + ext_species)
+    pooled_df = pd.DataFrame([
+        {"test": "external_species", "species": ",".join(ext_species), "focus_motif_fraction": external_fraction, "matched_empirical_p": external_p, "successful_iterations": external_successful, "valid_focus_species_pairs": external_pairs},
+        {"test": "all_non_reference", "species": ",".join(([args.within_species_label] if args.within_species_label in species_genomes else []) + ext_species), "focus_motif_fraction": nonfl4_fraction, "matched_empirical_p": nonfl4_p, "successful_iterations": nonfl4_successful, "valid_focus_species_pairs": nonfl4_pairs},
+    ])
+    pooled_df.to_csv(tables / "pooled_cross_species_motif_tests.tsv", sep="\t", index=False)
+    species_df["inference_scope"] = "fixed_candidate_exploratory_not_scan_adjusted"
+    species_df["discovery_full_family_q"] = selection["full_family_q"]
+    species_df.to_csv(tables / "species_motif_enrichment.tsv", sep="\t", index=False)
+
+    conservation_df.to_csv(tables / "focus_motif_conservation.tsv", sep="\t", index=False, na_rep="NA")
+    sequence_record_layout(promoter_df).to_csv(tables / "sequence_record_layout.tsv", sep="\t", index=False, na_rep="NA")
     summary = {
-        "motif": motif,
-        "reverse_complement": revcomp(motif),
-        "species": species_table.to_dict("records"),
+        **selection,
+        "execution_status": "COMPLETED",
+        "matched_iterations": args.matched_iterations,
+        "fisher_alternative": "greater",
+        "matched_tail": "upper",
+        "external_pooled_matched_p": external_p if np.isfinite(external_p) else None,
+        "external_pooled_fraction": external_fraction if np.isfinite(external_fraction) else None,
+        "genomic_scope": "between_sequence_record_distances_unknown",
+        "comparison_scope": "related_promoters_not_independent_infection_or_binding_validation",
+        "projection_mode": "explicit_upstream_mappings" if projection_inputs else "new_miniprot_projections",
     }
-    (tables / "motif_conservation.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    (tables / "motif_conservation.json").write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    pd.DataFrame([selection]).to_csv(tables / "fixed_motif_definition.tsv", sep="\t", index=False, na_rep="NA")
+    print("MOTIF_FOLLOW_UP=" + selection["status"], flush=True)
 
 
 if __name__ == "__main__":
