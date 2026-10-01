@@ -526,6 +526,8 @@ rule annotate_focus_proteins:
 
 rule regulatory_architecture:
     input:
+        code=f"{SCRIPTS}/analyze_regulatory_architecture.py",
+        motif_code=f"{SCRIPTS}/motif_inference.py",
         data=rules.prepare_expression_inputs.output,
         models=rules.fit_expression_models.output,
         summary=rules.summarize_expression_models.output,
@@ -533,6 +535,9 @@ rule regulatory_architecture:
         genome=f"{REF_ROOT}/{TARGET_LABEL}/genome.fna",
     output:
         directory(REGULATORY)
+    params:
+        motif_lengths=" ".join(str(k) for k in config["analysis"]["motif_lengths"]),
+        module_name=config["analysis"]["focus_module"]
     shell:
         """
         python {SCRIPTS}/analyze_regulatory_architecture.py \
@@ -544,6 +549,8 @@ rule regulatory_architecture:
           --samples {input.data}/samples_primary.tsv \
           --interaction-de {input.summary}/contrasts/bmr6_water_interaction.tsv \
           --genome {input.genome:q} --seed {SEED} \
+          --module-name {params.module_name:q} --motif-lengths {params.motif_lengths} \
+          --motif-fdr {config[analysis][motif_false_discovery_rate]} \
           --matched-iterations {config[analysis][regulatory_matched_set_iterations]} \
           --regulator-permutations {config[analysis][regulator_permutations]} \
           --promoter-bp {config[analysis][promoter_length_bp]} --output-dir {output:q}
@@ -552,6 +559,8 @@ rule regulatory_architecture:
 
 rule motif_conservation:
     input:
+        code=f"{SCRIPTS}/test_motif_conservation.py",
+        motif_code=f"{SCRIPTS}/motif_inference.py",
         regulatory=rules.regulatory_architecture.output,
         data=rules.prepare_expression_inputs.output,
         genomes=expand(f"{REF_ROOT}/{{label}}/genome.fna", label=COMPARISON_LABELS),
@@ -560,11 +569,16 @@ rule motif_conservation:
     threads:
         config["threads"]["annotation"]
     params:
-        genomes=" ".join(f"--genome {label}={REF_ROOT}/{label}/genome.fna" for label in COMPARISON_LABELS)
+        genomes=" ".join(f"--genome {label}={REF_ROOT}/{label}/genome.fna" for label in COMPARISON_LABELS),
+        mode=config["analysis"]["motif_follow_up"]["mode"],
+        motif=config["analysis"]["motif_follow_up"]["motif"]
     shell:
         """
         python {SCRIPTS}/test_motif_conservation.py \
           --motif-table {input.regulatory}/tables/promoter_kmer_enrichment.tsv \
+          --selection-mode {params.mode:q} --motif {params.motif:q} \
+          --selection-fdr {config[analysis][motif_false_discovery_rate]} \
+          --reference-label {TARGET_LABEL:q} --within-species-label {TARGET_ALT_LABEL:q} \
           --focus-promoters {input.regulatory}/tables/focus_promoters.tsv \
           --matched-pools {input.regulatory}/tables/matched_background_pools.tsv \
           --focus-promoter-fasta {input.regulatory}/sequences/focus_promoters.fasta \

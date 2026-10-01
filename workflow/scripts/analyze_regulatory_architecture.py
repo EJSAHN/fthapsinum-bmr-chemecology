@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import fisher_exact, spearmanr
 import statsmodels.api as sm
+from motif_inference import analyse_family
 
 
 def bh_adjust(pvals: Sequence[float]) -> np.ndarray:
@@ -247,7 +248,7 @@ def true_tf_mask(text: pd.Series) -> pd.Series:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Analyze genomic dispersion, residual coexpression, promoter k-mers, and candidate regulators.")
+    parser = argparse.ArgumentParser(description="Analyse sequence-record organisation, residual coexpression, promoter k-mers, and candidate regulators.")
     parser.add_argument("--annotation", type=Path, required=True)
     parser.add_argument("--focus-genes", type=Path, required=True)
     parser.add_argument("--module-scores", type=Path, required=True)
@@ -261,7 +262,12 @@ def main() -> None:
     parser.add_argument("--matched-iterations", type=int, default=20000)
     parser.add_argument("--regulator-permutations", type=int, default=50000)
     parser.add_argument("--promoter-bp", type=int, default=1000)
+    parser.add_argument("--module-name", default=None)
+    parser.add_argument("--motif-lengths", nargs="+", type=int, default=[6, 7])
+    parser.add_argument("--motif-fdr", type=float, default=0.10)
     args = parser.parse_args()
+    if args.matched_iterations < 1 or args.regulator_permutations < 1:
+        raise ValueError("Iteration counts must be positive")
 
     out = args.output_dir
     tables = out / "tables"
@@ -278,10 +284,19 @@ def main() -> None:
     interaction = pd.read_csv(args.interaction_de, sep="\t")
     scores = pd.read_csv(args.module_scores, sep="\t")
     scores = scores[scores["score_type"].eq("zmean")].copy()
+    if "module" in scores:
+        if args.module_name is not None:
+            scores = scores[scores["module"].eq(args.module_name)].copy()
+        elif scores["module"].nunique() != 1:
+            raise ValueError("Multiple module scores found; specify --module-name")
+    if scores.empty or scores["sample_id"].duplicated().any():
+        raise ValueError("Missing or duplicated selected module scores")
 
     if "group" not in samples:
         samples["group"] = samples["genotype"].astype(str) + "_" + samples["water"].astype(str)
-    sample_ids = [sample for sample in samples["sample_id"].astype(str) if sample in logcpm.columns]
+    sample_ids = samples["sample_id"].astype(str).tolist()
+    if len(set(sample_ids)) != len(sample_ids) or set(sample_ids) - set(logcpm.columns) or set(sample_ids) - set(counts.columns):
+        raise ValueError("Sample identifiers must be unique and present in both expression matrices")
     samples = samples[samples["sample_id"].isin(sample_ids)].copy()
     logcpm = logcpm.loc[:, sample_ids]
     counts = counts.reindex(columns=sample_ids).fillna(0)
@@ -381,8 +396,8 @@ def main() -> None:
         else:
             p = (1 + np.sum(null >= observed)) / (1 + len(null))
         cluster_rows.append({
-            "metric": metric, "observed": observed, "null_mean": float(np.nanmean(null)),
-            "null_median": float(np.nanmedian(null)), "empirical_p": p,
+            "metric": metric, "observed": observed, "null_mean": float(np.nanmean(null)) if np.isfinite(null).any() else np.nan,
+            "null_median": float(np.nanmedian(null)) if np.isfinite(null).any() else np.nan, "empirical_p": p,
         })
     pd.DataFrame(cluster_rows).to_csv(tables / "genomic_clustering.tsv", sep="\t", index=False, lineterminator="\n", na_rep="NA")
 
@@ -426,47 +441,12 @@ def main() -> None:
     }]).to_csv(tables / "coexpression_coherence.tsv", sep="\t", index=False, lineterminator="\n")
     pd.DataFrame(corr, index=focus_valid, columns=focus_valid).to_csv(tables / "residual_correlation_matrix.tsv", sep="\t", lineterminator="\n")
 
-    motif_presence: Dict[str, set] = {}
-    for gene in sorted(set(focus_valid + background_union)):
-        sequence = promoters[gene]
-        present = set()
-        for length in (6, 7):
-            for start in range(0, len(sequence) - length + 1):
-                kmer = sequence[start:start + length]
-                if set(kmer) <= set("ACGT"):
-                    present.add(canonical_kmer(kmer))
-        motif_presence[gene] = present
-    focus_counter = Counter(motif for gene in focus_valid for motif in motif_presence[gene])
-    background_counter = Counter(motif for gene in background_union for motif in motif_presence[gene])
-    motif_rows = []
-    for motif, a in focus_counter.items():
-        if a < 4:
-            continue
-        b = len(focus_valid) - a
-        c = background_counter.get(motif, 0)
-        d = len(background_union) - c
-        odds, p = fisher_exact([[a, b], [c, d]], alternative="greater")
-        motif_rows.append({
-            "motif": motif, "k": len(motif), "focus_present": a, "focus_total": len(focus_valid),
-            "background_present": c, "background_total": len(background_union), "odds_ratio": odds, "fisher_p": p,
-        })
-    motif_table = pd.DataFrame(motif_rows)
-    if not motif_table.empty:
-        motif_table["fisher_fdr"] = bh_adjust(motif_table["fisher_p"])
-        motif_table = motif_table.sort_values(["fisher_p", "motif"]).reset_index(drop=True)
-        top = motif_table.head(50)["motif"].tolist()
-        empirical = {}
-        for motif in top:
-            observed = int(motif_table.loc[motif_table["motif"].eq(motif), "focus_present"].iloc[0])
-            exceed = sum(sum(motif in motif_presence.get(gene, set()) for gene in matched) >= observed for matched in matched_sets)
-            empirical[motif] = (exceed + 1) / (len(matched_sets) + 1)
-        motif_table["matched_empirical_p"] = motif_table["motif"].map(empirical)
-        motif_table["robust"] = (
-            motif_table["fisher_fdr"].le(0.10)
-            & motif_table["matched_empirical_p"].fillna(1).le(0.01)
-            & motif_table["focus_present"].ge(5)
-        )
+    motif_table, motif_summary = analyse_family(
+        promoters, focus_valid, background_union, lengths=args.motif_lengths,
+        matched_sets=matched_sets, empirical_top=50, alpha=args.motif_fdr,
+    )
     motif_table.to_csv(tables / "promoter_kmer_enrichment.tsv", sep="\t", index=False, lineterminator="\n", na_rep="NA")
+    (tables / "motif_search_summary.json").write_text(json.dumps(motif_summary, indent=2) + "\n", encoding="utf-8")
 
     tf_mask = true_tf_mask(ann["annotation_text"])
     candidate_ids = [gene for gene in ann.index[tf_mask] if gene in logcpm.index and gene not in focus_set]
@@ -516,7 +496,12 @@ def main() -> None:
         "matched_p_mean_correlation": corr_p,
         "pc1_variance_explained": pc1_variance,
         "matched_p_pc1": pc1_p,
-        "robust_motifs": int(motif_table.get("robust", pd.Series(dtype=bool)).fillna(False).sum()),
+        "discovery_motifs": int(motif_table["passes_full_family_fdr"].sum()),
+        "hypotheses_in_family": int(len(motif_table)),
+        "motif_fdr_threshold": args.motif_fdr,
+        "genomic_scope": "sequence_record_positions_only; distances_between_records_unknown",
+        "clustering_test_direction": "enrichment_of_clustering_not_evidence_for_dispersion",
+        "motif_scope": "full_family_BH; fixed_motif_empirical_P_not_scan_adjusted",
         "robust_regulators": int(regulator_table.get("robust", pd.Series(dtype=bool)).fillna(False).sum()),
     }
     (tables / "regulatory_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

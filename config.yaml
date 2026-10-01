@@ -29,6 +29,13 @@ analysis:
   false_discovery_rate: 0.05
   minimum_absolute_log2_fold_change: 1.0
   promoter_length_bp: 1000
+  focus_module: aromatic_phenolic_metabolism
+  motif_lengths: [6, 7]
+  motif_false_discovery_rate: 0.10
+  # Explicit descriptive follow-up; this does not override the full-family result.
+  motif_follow_up:
+    mode: exploratory
+    motif: ATGCTAA
   matched_set_iterations: 10000
   regulatory_matched_set_iterations: 20000
   regulator_permutations: 50000
