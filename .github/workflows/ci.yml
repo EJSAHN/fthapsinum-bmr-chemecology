@@ -11,11 +11,18 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash -el {0}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: conda-incubator/setup-miniconda@v3
         with:
+          miniforge-version: latest
+          activate-environment: workflow-tests
           python-version: "3.11"
+          channels: conda-forge
+          conda-remove-defaults: true
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
@@ -23,6 +30,7 @@ jobs:
       - name: Record test environment
         run: |
           python --version
+          conda --version
           snakemake --version
           python -m pip freeze
       - name: Check Python syntax
