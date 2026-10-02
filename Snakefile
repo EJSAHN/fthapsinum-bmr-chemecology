@@ -293,7 +293,7 @@ rule summarize_mapping_3dai:
           --manifest {input.manifest:q} --species-dir {FT_ALIGN}/species \
           --summary-dir {FT_ALIGN}/summary --fastp-dir {FT_ALIGN}/fastp \
           --coverage-dir {FT_ALIGN}/coverage --target-group FT --inoculated-label fus \
-          --output-dir {output:q}
+          --rpm-basis input --output-dir {output:q}
         """
 
 
@@ -312,7 +312,7 @@ rule summarize_context_mapping:
           --manifest {input.manifest:q} --species-dir {FT_ALIGN}/species \
           --summary-dir {FT_ALIGN}/summary --fastp-dir {FT_ALIGN}/fastp \
           --coverage-dir {FT_ALIGN}/coverage --target-group FT --inoculated-label fus \
-          --output-dir {output:q}
+          --rpm-basis post_filter --output-dir {output:q}
         """
 
 
@@ -331,7 +331,7 @@ rule summarize_macrophomina_mapping:
           --manifest {input.manifest:q} --species-dir {MP_ALIGN}/species \
           --summary-dir {MP_ALIGN}/summary --fastp-dir {MP_ALIGN}/fastp \
           --coverage-dir {MP_ALIGN}/coverage --target-group MP --inoculated-label macro \
-          --output-dir {output:q}
+          --rpm-basis post_filter --output-dir {output:q}
         """
 
 
@@ -754,3 +754,6 @@ rule assess_macrophomina_signal:
           --inoculated-label macro --control-label pdb \
           --bam-suffix .bam --output-dir {output:q}
         """
+
+
+include: "workflow/rules/sample_sensitivity.smk"

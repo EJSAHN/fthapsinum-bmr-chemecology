@@ -1,0 +1,9 @@
+{
+  "focus_module": "aromatic_phenolic_metabolism",
+  "exclude_samples": ["bmr6_fus_dry_3_d"],
+  "exclusion_reason": "Low target-reference assignment fraction in competitive mapping",
+  "expected_primary_n": 22,
+  "expected_reduced_n": 21,
+  "expected_genes": 3926,
+  "expected_focus_genes": 10
+}

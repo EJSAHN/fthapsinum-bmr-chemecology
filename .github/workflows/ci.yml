@@ -44,3 +44,5 @@ jobs:
         run: snakemake --dry-run --cores 1
       - name: Parse optional pathogen workflow
         run: snakemake macrophomina --dry-run --cores 1
+      - name: Parse complete study and sensitivity workflow
+        run: snakemake complete_study --dry-run --cores 1
