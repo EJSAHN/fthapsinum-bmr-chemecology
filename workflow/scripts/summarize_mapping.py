@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
 from scipy.stats import mannwhitneyu, spearmanr
+from rna_metrics import calculate_metrics, fastp_read_counts
 
 
 def one_row(path: Path) -> dict[str, str]:
@@ -46,11 +47,6 @@ def coverage(path: Path) -> dict[str, float]:
     }
 
 
-def fastp_reads(path: Path) -> int:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return int(payload["summary"]["after_filtering"]["total_reads"])
-
-
 def robust_threshold(values: pd.Series) -> float:
     values = pd.to_numeric(values, errors="coerce").dropna()
     median = float(values.median())
@@ -78,47 +74,57 @@ def bh(values: pd.Series) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Summarize competitive mapping and pathogen RNA burden.")
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--species-dir", type=Path, required=True)
-    parser.add_argument("--summary-dir", type=Path, required=True)
-    parser.add_argument("--fastp-dir", type=Path, required=True)
-    parser.add_argument("--coverage-dir", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--summary-table", type=Path, help="Prepared per-sample input with explicit pre/post read counts")
+    parser.add_argument("--rpm-basis", choices=["input", "post_filter"], default="input")
+    parser.add_argument("--specificity-groups", nargs="+", default=None)
+    parser.add_argument("--species-dir", type=Path)
+    parser.add_argument("--summary-dir", type=Path)
+    parser.add_argument("--fastp-dir", type=Path)
+    parser.add_argument("--coverage-dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--target-group", default="FT")
     parser.add_argument("--inoculated-label", default="fus")
     args = parser.parse_args()
 
-    manifest = pd.read_csv(args.manifest, sep="\t", dtype=str, keep_default_na=False)
-    rows: list[dict[str, object]] = []
-    for record in manifest.to_dict("records"):
-        sample = record["sample_id"]
-        species = one_row(args.species_dir / f"{sample}.tsv")
-        species.update(coverage(args.coverage_dir / f"{sample}.thresholds.bed.gz"))
-        species["overall_alignment_pct"] = alignment_rate(args.summary_dir / f"{sample}.txt")
-        species["post_fastp_reads"] = fastp_reads(args.fastp_dir / f"{sample}.json")
-        species.update(record)
-        rows.append(species)
-    table = pd.DataFrame(rows)
+    if args.summary_table:
+        if any([args.manifest,args.species_dir,args.summary_dir,args.fastp_dir,args.coverage_dir]):
+            parser.error("Use summary-table OR raw summary directories, not both")
+        table = pd.read_csv(args.summary_table, sep="\t", keep_default_na=True)
+    else:
+        if not all([args.manifest,args.species_dir,args.summary_dir,args.fastp_dir,args.coverage_dir]):
+            parser.error("All five raw-summary inputs are required without summary-table")
+        manifest = pd.read_csv(args.manifest, sep="\t", dtype=str, keep_default_na=False)
+        rows = []
+        for record in manifest.to_dict("records"):
+            sample = record["sample_id"]
+            species = dict(record)
+            species.update(one_row(args.species_dir / f"{sample}.tsv"))
+            species.update(coverage(args.coverage_dir / f"{sample}.thresholds.bed.gz"))
+            species["overall_alignment_pct"] = alignment_rate(args.summary_dir / f"{sample}.txt")
+            payload = json.loads((args.fastp_dir / f"{sample}.json").read_text())
+            species["pre_fastp_reads"], species["post_fastp_reads"] = fastp_read_counts(payload)
+            rows.append(species)
+        table = pd.DataFrame(rows)
+    if table["sample_id"].duplicated().any():
+        raise ValueError("Duplicate sample identifiers")
 
     numeric_columns = {"dai", "sequencing_run", "expected_reads", "expected_bytes"}
     numeric_columns.update(column for column in table.columns if column.endswith(("_mapped", "_q20", "_unique")))
     numeric_columns.update({"all_primary", "unmapped_primary", "mapped_primary", "mapq_pass", "unique_pass",
                             "secondary_alignments", "supplementary_alignments", "duplicate_primary", "min_mapq",
-                            "overall_alignment_pct", "post_fastp_reads", "target_breadth_1x",
+                            "overall_alignment_pct", "pre_fastp_reads", "post_fastp_reads", "target_breadth_1x",
                             "target_breadth_3x", "target_breadth_5x"})
     for column in numeric_columns & set(table.columns):
         table[column] = pd.to_numeric(table[column], errors="coerce")
 
     group = args.target_group.lower()
-    target = pd.to_numeric(table.get(f"{group}_unique", 0), errors="coerce").fillna(0)
-    decoy_columns = [
-        column for column in table.columns
-        if column.endswith("_unique") and column not in {f"{group}_unique", "sb_unique", "other_unique"}
-    ]
-    decoy = table[decoy_columns].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1) if decoy_columns else pd.Series(0.0, index=table.index)
-    table["target_unique"] = target
-    table["target_unique_rpm"] = 1e6 * target / pd.to_numeric(table["post_fastp_reads"], errors="coerce").replace(0, np.nan)
-    table["target_specificity"] = target / (target + decoy).replace(0, np.nan)
+    fungi = ("ft", "fv", "fpro", "ffuj", "mp")
+    decoys = args.specificity_groups or (["fv", "fpro", "ffuj"] if group == "ft" else [g for g in fungi if g != group])
+    metrics = pd.DataFrame([calculate_metrics(r, group, decoys, fungi, args.rpm_basis)
+                            for r in table.to_dict("records")])
+    for column in metrics:
+        table[column] = metrics[column].to_numpy()
     table["host_unique_pct"] = 100 * pd.to_numeric(table.get("sb_unique", 0), errors="coerce") / pd.to_numeric(table["all_primary"], errors="coerce").replace(0, np.nan)
 
     controls = table[table["pathogen"].str.lower().eq("pdb")]
@@ -210,6 +216,8 @@ def main() -> None:
 
     summary = {
         "libraries": len(table),
+        "rpm_basis": args.rpm_basis,
+        "specificity_comparators": list(decoys),
         "background_threshold_rpm": threshold,
         "median_inoculated_rpm": float(inoculated["target_unique_rpm"].median()) if not inoculated.empty else None,
         "median_control_rpm": float(controls["target_unique_rpm"].median()) if not controls.empty else None,

@@ -20,11 +20,12 @@ authors:
 repository-code: "https://github.com/EJSAHN/fthapsinum-bmr-chemecology"
 url: "https://github.com/EJSAHN/fthapsinum-bmr-chemecology"
 license: MIT
+version: 1.6.0
+date-released: 2026-10-02
 abstract: >-
   Pathogen-side analysis of Fusarium thapsinum RNA in a public sorghum
-  QuantSeq experiment. The workflow separates RNA-derived burden from
-  relative transcript allocation and includes complete-family promoter
-  testing and explicitly labelled exploratory motif follow-up.
+  QuantSeq experiment, with explicit RNA denominators, fixed sample-exclusion
+  refits, complete-family promoter testing and comparative sequence analysis.
 keywords:
   - Fusarium thapsinum
   - sorghum
